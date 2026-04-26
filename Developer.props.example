@@ -1,0 +1,7 @@
+<Project>
+  <PropertyGroup>
+    <!-- <GameInstallDir>D:\Games\SteamLibrary\steamapps\common\Super Battle Golf</GameInstallDir> -->
+    <!-- <R2ProfileDir>$(APPDATA)\r2modmanPlus-local\SuperBattleGolf\profiles\Dev</R2ProfileDir> -->
+    <!-- <SkipDeploy>true</SkipDeploy> -->
+  </PropertyGroup>
+</Project>

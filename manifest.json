@@ -1,0 +1,9 @@
+{
+    "name": "EventChatNotifications",
+    "version_number": "0.3.0",
+    "website_url": "",
+    "description": "Posts a narrator-style line in the vanilla text chat whenever a notable match event fires (hole in one, perfect drive, chip in, speedrun, knockouts).",
+    "dependencies": [
+        "BepInEx-BepInExPack-5.4.2305"
+    ]
+}

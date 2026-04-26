@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>EventChatNotifications</AssemblyName>
+    <RootNamespace>EventChatNotifications</RootNamespace>
+  </PropertyGroup>
+</Project>
