@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.4.0
+
+- **Cut the noise. Only chat now when a player moves into first place** on one of the
+  tab-menu leaderboard metrics the vanilla game already tracks: `bestHoleScore`,
+  `longestChipIn`, `avgFinishTime`, `itemPickups`, and K/O ratio
+  (`matchKnockouts / max(1, matchKnockedOut)`). Stable tie-break by `joinIndex` so a true
+  tie doesn't ping-pong "Alice leads / Bob leads / Alice leads" across reconciles. Solo
+  sessions stay quiet (skipped when fewer than two non-spectators are connected).
+- Removed v0.3.0's pairwise score / knockouts / strokes overtake firehose, the
+  per-knockout chat line, the per-shot chip-in line, and the perfect-drive `SwingNiceShot`
+  VFX hook. Hole-event notifications retained: hole-in-one / albatross / eagle / birdie /
+  condor (via `InfoFeed.StrokesMessageData`) and speedrun (via `SpeedrunMessageData`) —
+  the rest is treated as scoreboard-noise that already has a UI surface.
+
 ## v0.3.0
 
 - Add stat-pass notifications. Each modded client subscribes to

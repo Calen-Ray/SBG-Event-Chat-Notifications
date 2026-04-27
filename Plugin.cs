@@ -13,7 +13,7 @@ namespace EventChatNotifications
     {
         public const string ModGuid = "sbg.eventchatnotifications";
         public const string ModName = "EventChatNotifications";
-        public const string ModVersion = "0.3.0";
+        public const string ModVersion = "0.4.0";
 
         internal static ManualLogSource Log;
 
@@ -21,27 +21,40 @@ namespace EventChatNotifications
         {
             Log = Logger;
             new Harmony(ModGuid).PatchAll();
-            StatPassTracker.Hook();
+            FirstPlaceTracker.Hook();
             Log.LogInfo($"{ModName} v{ModVersion} loaded.");
         }
 
         private void OnDestroy()
         {
-            StatPassTracker.Unhook();
+            FirstPlaceTracker.Unhook();
         }
     }
 
-    // Watches CourseManager.PlayerStates and posts a chat line whenever one player overtakes
-    // another on a tracked metric (score / knockouts / strokes). Pure local renderer per
-    // modded client — no Mirror traffic, every modded peer reads the same SyncList state.
-    internal static class StatPassTracker
+    // Watches CourseManager.PlayerStates and posts a chat line when a *new* player takes
+    // first place on one of the leaderboard metrics that the game already syncs:
+    //   - bestHoleScore   (StrokesUnderParType, higher enum = better)
+    //   - longestChipIn   (metres, higher = better; default float.MinValue)
+    //   - avgFinishTime   (seconds, lower = better; default 0 = no finishes yet)
+    //   - itemPickups     (count, higher = better)
+    //   - K/O ratio       (matchKnockouts / max(1, matchKnockedOut), higher = better)
+    //
+    // No Mirror traffic — every modded peer reads the same SyncList and renders locally.
+    // 0.3.0 announced every pairwise overtake on score / knockouts / strokes, which was
+    // intentional firehose during scoring; 0.4.0 narrows to "moved into first" on metrics
+    // a player would actually brag about.
+    internal static class FirstPlaceTracker
     {
-        private enum Metric { Score, Knockouts, Strokes }
+        private enum Metric { BestHoleScore, LongestChipIn, AvgFinishTime, ItemPickups, KORatio }
 
-        // For Score / Knockouts higher is better; for Strokes lower is better. The
-        // "passed" trigger is: was strictly worse last sample → now better-or-equal.
-        private static readonly Metric[] AllMetrics = { Metric.Score, Metric.Knockouts, Metric.Strokes };
-        private static readonly Dictionary<long, sbyte> PreviousSign = new Dictionary<long, sbyte>();
+        private static readonly Metric[] AllMetrics =
+        {
+            Metric.BestHoleScore, Metric.LongestChipIn, Metric.AvgFinishTime,
+            Metric.ItemPickups, Metric.KORatio,
+        };
+
+        // Per-metric leader. Absent key = no leader yet (no eligible player).
+        private static readonly Dictionary<Metric, ulong> CurrentLeader = new Dictionary<Metric, ulong>();
         private static bool subscribed;
 
         internal static void Hook()
@@ -55,82 +68,191 @@ namespace EventChatNotifications
         {
             if (!subscribed) return;
             CourseManager.PlayerStatesChanged -= OnPlayerStatesChanged;
-            PreviousSign.Clear();
+            CurrentLeader.Clear();
             subscribed = false;
         }
 
         private static void OnPlayerStatesChanged(SyncList<CourseManager.PlayerState>.Operation op, int index, CourseManager.PlayerState changed)
         {
-            // Walk the full list each time and reconcile pairwise comparisons. SyncList
-            // changes fire frequently during scoring so we keep this small-N (lobbies are
-            // capped well under a dozen) and rebuild the sign dictionary each tick.
             SyncList<CourseManager.PlayerState> states = CourseManager.PlayerStates;
-            if (states == null || states.Count < 2) return;
+            if (states == null) return;
 
-            // First pass: snapshot. Then post messages for transitions.
-            int n = states.Count;
-            for (int i = 0; i < n; i++)
+            // No leader concept makes sense in solo sessions; bail until at least two
+            // non-spectators are present.
+            int active = 0;
+            for (int i = 0; i < states.Count; i++)
+                if (!states[i].isSpectator && states[i].isConnected) active++;
+            if (active < 2) return;
+
+            foreach (Metric metric in AllMetrics)
+                Reconcile(states, metric);
+        }
+
+        private static void Reconcile(SyncList<CourseManager.PlayerState> states, Metric metric)
+        {
+            if (!TryComputeLeader(states, metric, out ulong leaderGuid, out string valueLabel))
+                return; // No eligible leader yet (everyone still at default).
+
+            bool hadPrev = CurrentLeader.TryGetValue(metric, out ulong prevLeader);
+            if (hadPrev && prevLeader == leaderGuid)
+                return;
+
+            CurrentLeader[metric] = leaderGuid;
+
+            string playerName = Narrator.PlayerNameFromGuid(leaderGuid);
+            Narrator.Post($"{playerName} leads on {MetricLabel(metric)} — {valueLabel}.");
+        }
+
+        // Returns true and sets out-params iff at least one player has a non-default value
+        // on this metric. Ties (two players with the exact same best value) keep whichever
+        // was already the leader if applicable, otherwise pick the lower joinIndex for
+        // determinism — but never *announce* a tie as a new leader (the caller's caching
+        // takes care of suppressing the no-op).
+        private static bool TryComputeLeader(SyncList<CourseManager.PlayerState> states, Metric metric, out ulong leaderGuid, out string valueLabel)
+        {
+            leaderGuid = 0;
+            valueLabel = null;
+
+            // Track the best-value-seen and the candidate leader. Compare floats / ints
+            // separately to avoid lossy casts at the boundary.
+            bool haveCandidate = false;
+            ulong candidate = 0;
+            int candidateJoinIndex = int.MaxValue;
+            float bestFloat = 0f;
+            int bestInt = 0;
+
+            for (int i = 0; i < states.Count; i++)
             {
-                CourseManager.PlayerState a = states[i];
-                if (a.isSpectator) continue;
-                for (int j = 0; j < n; j++)
+                CourseManager.PlayerState s = states[i];
+                if (s.isSpectator || !s.isConnected) continue;
+                if (!IsEligible(s, metric)) continue;
+
+                bool better;
+                if (!haveCandidate)
                 {
-                    if (i == j) continue;
-                    CourseManager.PlayerState b = states[j];
-                    if (b.isSpectator) continue;
-
-                    foreach (Metric metric in AllMetrics)
-                    {
-                        int aVal = ReadMetric(a, metric);
-                        int bVal = ReadMetric(b, metric);
-                        sbyte newSign = CompareForBetter(aVal, bVal, metric);
-
-                        long key = MakeKey(a.playerGuid, b.playerGuid, metric);
-                        sbyte oldSign = PreviousSign.TryGetValue(key, out sbyte stored) ? stored : (sbyte)0;
-                        PreviousSign[key] = newSign;
-
-                        // Trigger only on the rising edge: a was strictly worse (-1) and is
-                        // now tied-or-better (>=0). This avoids posting on the initial seed
-                        // (oldSign defaults to 0) and on tie oscillations.
-                        if (oldSign == -1 && newSign >= 0)
-                        {
-                            string passer = Narrator.PlayerNameFromGuid(a.playerGuid);
-                            string passed = Narrator.PlayerNameFromGuid(b.playerGuid);
-                            Narrator.Post($"{passer} passed {passed} on {MetricLabel(metric)}.");
-                        }
-                    }
+                    better = true;
                 }
+                else if (UsesIntComparison(metric))
+                {
+                    int v = ReadInt(s, metric);
+                    better = LowerIsBetter(metric) ? (v < bestInt) : (v > bestInt);
+                }
+                else
+                {
+                    float v = ReadFloat(s, metric);
+                    better = LowerIsBetter(metric) ? (v < bestFloat) : (v > bestFloat);
+                }
+
+                if (better)
+                {
+                    candidate = s.playerGuid;
+                    candidateJoinIndex = s.joinIndex;
+                    haveCandidate = true;
+                    if (UsesIntComparison(metric)) bestInt = ReadInt(s, metric);
+                    else                           bestFloat = ReadFloat(s, metric);
+                }
+                else if (HasTie(s, metric, bestInt, bestFloat) && s.joinIndex < candidateJoinIndex)
+                {
+                    // Stable tie-break by joinIndex — same player wins ties across reconciles
+                    // so we don't ping-pong announcements when two players hit the same value.
+                    candidate = s.playerGuid;
+                    candidateJoinIndex = s.joinIndex;
+                }
+            }
+
+            if (!haveCandidate)
+                return false;
+
+            leaderGuid = candidate;
+            valueLabel = FormatValue(states, candidate, metric, bestInt, bestFloat);
+            return true;
+        }
+
+        private static bool IsEligible(CourseManager.PlayerState s, Metric metric)
+        {
+            switch (metric)
+            {
+                case Metric.BestHoleScore: return s.bestHoleScore > StrokesUnderParType.None;
+                case Metric.LongestChipIn: return s.longestChipIn > float.MinValue;
+                case Metric.AvgFinishTime: return s.avgFinishTime > 0f && s.finishes > 0;
+                case Metric.ItemPickups:   return s.itemPickups > 0;
+                case Metric.KORatio:       return s.matchKnockouts > 0;
+                default: return false;
             }
         }
 
-        private static int ReadMetric(CourseManager.PlayerState s, Metric m)
+        private static bool UsesIntComparison(Metric m)
+        {
+            return m == Metric.BestHoleScore || m == Metric.ItemPickups;
+        }
+
+        private static bool LowerIsBetter(Metric m)
+        {
+            return m == Metric.AvgFinishTime;
+        }
+
+        private static int ReadInt(CourseManager.PlayerState s, Metric m)
         {
             switch (m)
             {
-                case Metric.Score: return s.matchScore;
-                case Metric.Knockouts: return s.matchKnockouts;
-                case Metric.Strokes: return s.matchStrokes;
+                case Metric.BestHoleScore: return (int)s.bestHoleScore;
+                case Metric.ItemPickups:   return s.itemPickups;
                 default: return 0;
             }
         }
 
-        private static sbyte CompareForBetter(int a, int b, Metric m)
+        private static float ReadFloat(CourseManager.PlayerState s, Metric m)
         {
-            // For Score and Knockouts, higher is better. For Strokes, lower is better.
-            int signed = (m == Metric.Strokes) ? b - a : a - b;
-            if (signed > 0) return 1;
-            if (signed < 0) return -1;
-            return 0;
+            switch (m)
+            {
+                case Metric.LongestChipIn: return s.longestChipIn;
+                case Metric.AvgFinishTime: return s.avgFinishTime;
+                case Metric.KORatio:       return ComputeKORatio(s);
+                default: return 0f;
+            }
         }
 
-        private static long MakeKey(ulong a, ulong b, Metric m)
+        private static float ComputeKORatio(CourseManager.PlayerState s)
         {
-            // Pair-key into a 64-bit hash. Lobbies are tiny (<= 8 players) so this just needs
-            // to be deterministic and avoid collisions for a single session.
-            unchecked
+            // Standard FPS-style ratio: KOs delivered ÷ max(1, KOs received). Players with
+            // zero deaths get raw KO count as their ratio, which is the right behaviour —
+            // never-died-and-knocked-out-five is a stronger story than 5/1 = 5.0.
+            int denom = Mathf.Max(1, s.matchKnockedOut);
+            return (float)s.matchKnockouts / denom;
+        }
+
+        private static bool HasTie(CourseManager.PlayerState s, Metric metric, int bestInt, float bestFloat)
+        {
+            if (UsesIntComparison(metric))
+                return ReadInt(s, metric) == bestInt;
+            return Mathf.Approximately(ReadFloat(s, metric), bestFloat);
+        }
+
+        private static string FormatValue(SyncList<CourseManager.PlayerState> states, ulong leaderGuid, Metric metric, int bestInt, float bestFloat)
+        {
+            switch (metric)
             {
-                long h = (long)((a * 1099511628211UL) ^ b);
-                return (h << 2) | (long)m;
+                case Metric.BestHoleScore:
+                    return DescribeStrokesUnderPar((StrokesUnderParType)bestInt);
+                case Metric.LongestChipIn:
+                    return $"{Mathf.RoundToInt(bestFloat)}m";
+                case Metric.AvgFinishTime:
+                    return $"{bestFloat:0.0}s";
+                case Metric.ItemPickups:
+                    return bestInt.ToString();
+                case Metric.KORatio:
+                {
+                    // Reach back into the leader's state for the (KOs/deaths) breakdown so
+                    // the chat line carries both the ratio and the raw counts.
+                    for (int i = 0; i < states.Count; i++)
+                    {
+                        if (states[i].playerGuid != leaderGuid) continue;
+                        var s = states[i];
+                        return $"{bestFloat:0.00} ({s.matchKnockouts}/{s.matchKnockedOut})";
+                    }
+                    return bestFloat.ToString("0.00");
+                }
+                default: return string.Empty;
             }
         }
 
@@ -138,19 +260,34 @@ namespace EventChatNotifications
         {
             switch (m)
             {
-                case Metric.Score: return "score";
-                case Metric.Knockouts: return "knockouts";
-                case Metric.Strokes: return "putts";
+                case Metric.BestHoleScore: return "best hole";
+                case Metric.LongestChipIn: return "longest chip-in";
+                case Metric.AvgFinishTime: return "average finish time";
+                case Metric.ItemPickups:   return "item pickups";
+                case Metric.KORatio:       return "K/O ratio";
                 default: return "stat";
+            }
+        }
+
+        private static string DescribeStrokesUnderPar(StrokesUnderParType type)
+        {
+            switch (type)
+            {
+                case StrokesUnderParType.HoleInOne: return "Hole in One";
+                case StrokesUnderParType.Condor:    return "Condor";
+                case StrokesUnderParType.Albatross: return "Albatross";
+                case StrokesUnderParType.Eagle:     return "Eagle";
+                case StrokesUnderParType.Birdie:    return "Birdie";
+                case StrokesUnderParType.Par:       return "Par";
+                default: return "—";
             }
         }
     }
 
     internal static class Narrator
     {
-        // Narrator prefix mimics a non-player chat author. Vanilla chat messages are formatted
-        // as "[playerName]: [message]" — we go with a stand-alone bracketed prefix so the
-        // notification reads as system / commentary rather than impersonating a player.
+        // Stand-alone bracketed prefix so the line reads as system commentary rather than
+        // impersonating a player.
         private const string Prefix = "<color=#9aa6ff><b>[Match]</b></color> ";
 
         internal static void Post(string message)
@@ -163,20 +300,15 @@ namespace EventChatNotifications
             }
             catch
             {
-                // TextChatUi singleton may not be initialised yet on some scene loads. Fall back
-                // to logging so the event isn't silently lost.
                 Plugin.Log?.LogInfo($"[chat-fallback] {message}");
             }
         }
 
         internal static string PlayerNameFromGuid(ulong guid)
         {
-            // Local player first, then remote — small lobbies, linear scan is fine.
             PlayerInfo local = GameManager.LocalPlayerInfo;
             if (local != null && local.PlayerId != null && local.PlayerId.Guid == guid)
-            {
                 return local.PlayerId.PlayerNameNoRichText;
-            }
             if (GameManager.RemotePlayers != null)
             {
                 foreach (PlayerInfo remote in GameManager.RemotePlayers)
@@ -195,80 +327,15 @@ namespace EventChatNotifications
             {
                 case StrokesUnderParType.HoleInOne: return "scored a hole in one!";
                 case StrokesUnderParType.Albatross: return "landed an albatross!";
-                case StrokesUnderParType.Eagle: return "landed an eagle!";
-                case StrokesUnderParType.Birdie: return "landed a birdie!";
-                case StrokesUnderParType.Condor: return "pulled off a condor!";
+                case StrokesUnderParType.Eagle:     return "landed an eagle!";
+                case StrokesUnderParType.Birdie:    return "landed a birdie!";
+                case StrokesUnderParType.Condor:    return "pulled off a condor!";
                 default: return null;
             }
         }
     }
 
-    // SwingNiceShot is replicated to every client via VfxManager.ServerPlayPooledVfxForAllClients,
-    // which means the nice-shot visual fires globally — including on the driving range, where
-    // InfoFeed RPCs never run because there's no hole-completion event. Hooking here gives us
-    // per-shot chat coverage everywhere a perfect-swing visual lands.
-    internal static class NiceShotChatHook
-    {
-        private const float DuplicateDebounceSeconds = 0.5f;
-        private const float ProximityMatchSquared = 9f * 9f; // 9 m max from VFX origin to player
-
-        private static float lastPostTime;
-        private static Vector3 lastPostPosition;
-
-        internal static void OnSwingNiceShot(Vector3 position)
-        {
-            // Multi-hit perfect swings fire the VFX several times in the same frame; debounce
-            // by both time and position so a single shot only posts a single chat line.
-            float now = Time.unscaledTime;
-            if (now - lastPostTime < DuplicateDebounceSeconds &&
-                (position - lastPostPosition).sqrMagnitude < 1f)
-            {
-                return;
-            }
-            lastPostTime = now;
-            lastPostPosition = position;
-
-            string playerName = ResolveNearestPlayerName(position);
-            Narrator.Post($"{playerName} hit a perfect drive!");
-        }
-
-        private static string ResolveNearestPlayerName(Vector3 position)
-        {
-            PlayerInfo best = null;
-            float bestSqr = ProximityMatchSquared;
-
-            PlayerInfo local = GameManager.LocalPlayerInfo;
-            if (local != null && local.transform != null)
-            {
-                float sqr = (local.transform.position - position).sqrMagnitude;
-                if (sqr <= bestSqr) { best = local; bestSqr = sqr; }
-            }
-            if (GameManager.RemotePlayers != null)
-            {
-                foreach (PlayerInfo remote in GameManager.RemotePlayers)
-                {
-                    if (remote == null || remote.transform == null) continue;
-                    float sqr = (remote.transform.position - position).sqrMagnitude;
-                    if (sqr < bestSqr) { best = remote; bestSqr = sqr; }
-                }
-            }
-            if (best == null || best.PlayerId == null)
-                return "Someone";
-            return best.PlayerId.PlayerNameNoRichText;
-        }
-    }
-
-    [HarmonyPatch(typeof(VfxManager), "PlayPooledVfxLocalOnlyInternal",
-        new[] { typeof(VfxType), typeof(Vector3), typeof(Quaternion), typeof(Vector3), typeof(uint), typeof(bool), typeof(float), typeof(Action<PoolableParticleSystem>) })]
-    internal static class Patch_VfxManager_NiceShot
-    {
-        private static void Postfix(VfxType vfxType, Vector3 position)
-        {
-            if (vfxType != VfxType.SwingNiceShot) return;
-            NiceShotChatHook.OnSwingNiceShot(position);
-        }
-    }
-
+    // Per-hole event notifications retained: hole-in-one / albatross / eagle / birdie / condor.
     [HarmonyPatch(typeof(InfoFeed), "UserCode_RpcShowMessage__StrokesMessageData")]
     internal static class Patch_StrokesMessage
     {
@@ -276,22 +343,13 @@ namespace EventChatNotifications
         {
             string verb = Narrator.DescribeStrokesUnderPar(messageData.strokesUnderParType);
             if (verb == null)
-                return; // Skip Par — it's the default "expected outcome" line and would be noisy.
+                return; // Skip Par — default outcome line.
             string player = Narrator.PlayerNameFromGuid(messageData.playerGuid);
             Narrator.Post($"{player} {verb}");
         }
     }
 
-    [HarmonyPatch(typeof(InfoFeed), "UserCode_RpcShowMessage__ChipInMessageData")]
-    internal static class Patch_ChipInMessage
-    {
-        private static void Postfix(InfoFeed.ChipInMessageData messageData)
-        {
-            string player = Narrator.PlayerNameFromGuid(messageData.playerGuid);
-            Narrator.Post($"{player} chipped in from {Mathf.RoundToInt(messageData.distance)}m!");
-        }
-    }
-
+    // Speedrun retained — distinct hole-event the user explicitly called out.
     [HarmonyPatch(typeof(InfoFeed), "UserCode_RpcShowMessage__SpeedrunMessageData")]
     internal static class Patch_SpeedrunMessage
     {
@@ -302,16 +360,9 @@ namespace EventChatNotifications
         }
     }
 
-    [HarmonyPatch(typeof(InfoFeed), "UserCode_RpcShowMessage__KnockoutMessageData")]
-    internal static class Patch_KnockoutMessage
-    {
-        private static void Postfix(InfoFeed.KnockoutMessageData messageData)
-        {
-            string responsible = Narrator.PlayerNameFromGuid(messageData.responsiblePlayer);
-            string victim = Narrator.PlayerNameFromGuid(messageData.knockedOutPlayer);
-            if (responsible == victim)
-                return; // self-knockouts have their own dedicated message data type.
-            Narrator.Post($"{responsible} knocked out {victim}.");
-        }
-    }
+    // 0.3.0 also posted per-shot chip-in / per-knockout / nice-shot lines and pairwise
+    // score/knockout/strokes overtakes. Per the 0.4.0 brief those are noise — chip-in
+    // brags now surface only when someone takes first place on the longestChipIn
+    // leaderboard, knockouts surface as K/O-ratio leadership changes, and the perfect-
+    // drive nice-shot VFX hook is gone entirely.
 }

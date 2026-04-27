@@ -1,8 +1,8 @@
 {
     "name": "EventChatNotifications",
-    "version_number": "0.3.0",
+    "version_number": "0.4.0",
     "website_url": "",
-    "description": "Posts a narrator-style line in the vanilla text chat whenever a notable match event fires (hole in one, perfect drive, chip in, speedrun, knockouts).",
+    "description": "Posts a narrator-style line in the vanilla text chat when a player takes first place on a tracked tab-menu metric (best hole, longest chip-in, average finish time, item pickups, K/O ratio) or when a hole-event lands (hole in one, eagle, birdie, speedrun).",
     "dependencies": [
         "BepInEx-BepInExPack-5.4.2305"
     ]
