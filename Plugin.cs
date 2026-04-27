@@ -13,7 +13,7 @@ namespace EventChatNotifications
     {
         public const string ModGuid = "sbg.eventchatnotifications";
         public const string ModName = "EventChatNotifications";
-        public const string ModVersion = "0.4.0";
+        public const string ModVersion = "0.4.1";
 
         internal static ManualLogSource Log;
 
@@ -100,7 +100,14 @@ namespace EventChatNotifications
             CurrentLeader[metric] = leaderGuid;
 
             string playerName = Narrator.PlayerNameFromGuid(leaderGuid);
-            Narrator.Post($"{playerName} leads on {MetricLabel(metric)} — {valueLabel}.");
+            string label = MetricLabel(metric);
+            // Two phrasings: "from X" when we're displacing a real previous leader, plain
+            // "took first" otherwise. Self-displacement (prevLeader == leaderGuid) is filtered
+            // upstream by the equality check above, so we don't need to handle it here.
+            string line = hadPrev
+                ? $"{playerName} took first on {label} from {Narrator.PlayerNameFromGuid(prevLeader)} — {valueLabel}."
+                : $"{playerName} took first on {label} — {valueLabel}.";
+            Narrator.Post(line);
         }
 
         // Returns true and sets out-params iff at least one player has a non-default value

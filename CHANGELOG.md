@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.1
+
+- Include the displaced leader in the announcement: `Alice took first on longest chip-in
+  from Bob — 27m.` First-time leaders (no prior holder) still read as
+  `Alice took first on longest chip-in — 27m.`.
+
 ## v0.4.0
 
 - **Cut the noise. Only chat now when a player moves into first place** on one of the
