@@ -81,7 +81,7 @@ namespace EventChatNotifications
             // non-spectators are present.
             int active = 0;
             for (int i = 0; i < states.Count; i++)
-                if (!states[i].isSpectator && states[i].isConnected) active++;
+                if (!states[i].isInSpectatorMode && states[i].isConnected) active++;
             if (active < 2) return;
 
             foreach (Metric metric in AllMetrics)
@@ -131,7 +131,7 @@ namespace EventChatNotifications
             for (int i = 0; i < states.Count; i++)
             {
                 CourseManager.PlayerState s = states[i];
-                if (s.isSpectator || !s.isConnected) continue;
+                if (s.isInSpectatorMode || !s.isConnected) continue;
                 if (!IsEligible(s, metric)) continue;
 
                 bool better;
