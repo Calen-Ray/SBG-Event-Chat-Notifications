@@ -13,7 +13,7 @@ namespace EventChatNotifications
     {
         public const string ModGuid = "sbg.eventchatnotifications";
         public const string ModName = "EventChatNotifications";
-        public const string ModVersion = "0.4.1";
+        public const string ModVersion = "0.4.2";
 
         internal static ManualLogSource Log;
 

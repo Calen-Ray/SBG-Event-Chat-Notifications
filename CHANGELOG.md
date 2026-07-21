@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.4.2
+
+- Fix compatibility with the July 2026 Super Battle Golf engine update:
+  `CourseManager.PlayerState.isSpectator` was renamed to `isInSpectatorMode`.
+
 ## v0.4.1
 
 - Include the displaced leader in the announcement: `Alice took first on longest chip-in

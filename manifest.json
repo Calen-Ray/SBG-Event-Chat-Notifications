@@ -1,6 +1,6 @@
 {
     "name": "EventChatNotifications",
-    "version_number": "0.4.1",
+    "version_number": "0.4.2",
     "website_url": "",
     "description": "Posts a narrator-style line in the vanilla text chat when a player takes first place on a tracked tab-menu metric (best hole, longest chip-in, average finish time, item pickups, K/O ratio) or when a hole-event lands (hole in one, eagle, birdie, speedrun).",
     "dependencies": [
